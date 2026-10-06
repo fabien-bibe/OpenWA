@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookOutboxService } from './webhook-outbox.service';
 import { WebhookDeliveryService } from './webhook-delivery.service';
+import { isDeliverableWebhook } from './utils/deliver-once';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
@@ -60,6 +61,7 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('WebhookReconcilerService');
   private timer?: ReturnType<typeof setInterval>;
   private sweeping = false;
+  private cursor?: string;
 
   constructor(
     @InjectRepository(Webhook, 'data') private readonly webhooks: Repository<Webhook>,
@@ -70,7 +72,7 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
   onModuleInit(): void {
     const opts = resolveWebhookReconcilerOptions();
     if (opts.intervalMs <= 0) {
-      this.logger.log('Webhook delivery reconciler disabled (WEBHOOK_RECONCILE_INTERVAL_MS <= 0)');
+      this.logger.log('Webhook delivery reconciler disabled (WEBHOOK_RECONCILE_INTERVAL_MS=0)');
       return;
     }
     this.timer = setInterval(() => {
@@ -91,24 +93,51 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
     if (this.sweeping) return stats;
     this.sweeping = true;
     try {
-      const rows = await this.outbox.findStale(new Date(now.getTime() - opts.graceMs), opts.batchSize);
+      const cutoff = new Date(now.getTime() - opts.graceMs);
+      let rows = await this.outbox.findStale(cutoff, opts.batchSize, this.cursor);
+      if (rows.length === 0 && this.cursor) {
+        this.cursor = undefined;
+        rows = await this.outbox.findStale(cutoff, opts.batchSize);
+      }
+      // Live jobs may occupy a whole page. Advance past them without spending their replay budget.
+      this.cursor = rows.at(-1)?.id;
       stats.scanned = rows.length;
       for (const row of rows) {
-        if (row.attempts >= opts.maxAttempts) {
-          // Budget spent: stop replaying and leave the failure row as the recovery path.
-          await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
-          stats.failed++;
+        if (this.delivery.isLocallyPending(row.idempotencyKey)) {
+          // Still owned by a dispatch on this node (parked in the limiter or mid retry loop), so it
+          // is slow rather than stranded. Replaying it would POST alongside the original and outside
+          // the dispatch concurrency bound, and would spend its budget while it is still running.
+          stats.skipped++;
           continue;
         }
         const webhook = await this.webhooks.findOne({ where: { id: row.webhookId } });
-        if (!webhook || !webhook.active) {
-          // The subscription is gone or switched off; replaying it would deliver an event the
-          // operator has already unsubscribed from.
+        if (!isDeliverableWebhook(webhook, row.event, row.sessionId)) {
+          // The subscription is gone, switched off or no longer lists this event; replaying it would
+          // deliver an event the operator has already unsubscribed from. Same test as the queue
+          // processor applies before every attempt.
           await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
           stats.skipped++;
           continue;
         }
-        await this.outbox.countAttempt(row.id, row.attempts);
+        if (row.deliveryId && (await this.delivery.isQueueJobPending(row.deliveryId))) {
+          stats.skipped++;
+          continue;
+        }
+        if (row.attempts >= opts.maxAttempts) {
+          // A database fault may have prevented every terminal failure write. Keep the outbox
+          // payload until this handoff succeeds, without sending beyond the replay budget.
+          if (await this.delivery.recordReplayExhaustion(row, webhook.url)) {
+            await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
+          }
+          stats.failed++;
+          continue;
+        }
+        if (!(await this.outbox.countAttempt(row.id, row.attempts))) {
+          // Settled since the batch was read, typically a local dispatch that finished while an
+          // earlier row in this pass was replaying. The copy in hand is stale; replaying it duplicates.
+          stats.skipped++;
+          continue;
+        }
         try {
           // The outcome is a RETURN VALUE, not an exception. Every delivery failure is handled in
           // place (dead-letter row, hook, log), so redeliver resolves either way and a catch here
@@ -121,15 +150,15 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
             row.idempotencyKey,
             row.payload,
           );
-          if (outcome === 'failed') {
+          if (outcome === 'failed' || outcome === 'unrecorded') {
             // Left 'pending' on purpose: the next sweep retries it until the budget is spent.
             this.logger.warn(`Replay of ${row.event} to webhook ${row.webhookId} did not deliver`);
             stats.failed++;
             continue;
           }
-          // 'delivered', 'enqueued' and 'cancelled' all retire the row: the delivery either reached a
-          // durable owner or a plugin dropped it on purpose. Only 'failed' is worth another sweep.
-          await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
+          // Enqueued rows retain their copy until the worker settles them. Success and deliberate
+          // cancellation can retire immediately.
+          if (outcome !== 'enqueued') await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
           stats.replayed++;
         } catch (error) {
           // An exception is an unexpected fault rather than a delivery failure; the row stays
